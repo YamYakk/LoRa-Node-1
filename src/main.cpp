@@ -1,9 +1,9 @@
 // ============================================================================
-// main.cpp — RadioLib LoRaWAN OTAA with session persistence + Heltec V3 Battery
+// main.cpp — RadioLib LoRaWAN OTAA with session persistence
 // Target: ESP32/ESP32-S3 + RadioLib (LoRaWAN)
 // Requires:
 //   - jgromes/RadioLib with LoRaWAN support
-//   - Arduino-ESP32 core (Preferences + analogReadMilliVolts)
+//   - Arduino-ESP32 core (Preferences)
 //   - Your "config_node5.h" must define:
 //       radio, node, joinEUI, devEUI, nwkKey, appKey, uplinkIntervalSeconds
 //
@@ -12,8 +12,7 @@
 //      session (keys, nonces, FCnt) to NVS.
 //   2) Reboot: restores session (no join), sends uplinks immediately, and saves
 //      the session after every uplink to keep FCnt in sync.
-//   3) Reads battery voltage on Heltec WiFi LoRa 32 V3 by pulling GPIO37 LOW to
-//      route VBAT to GPIO1 through a 390k/100k divider, then reads ADC.
+//   3) Sends HTU21D data, the upload count, and last downlink RSSI once per wake.
 //
 // Tip: If you ever need to force a fresh join, temporarily clear NVS "lw"
 //      namespace (see optional factory reset snippet below).
@@ -24,11 +23,10 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "config_node5.h"    // radio, node, joinEUI/devEUI/keys, Region/subBand
+#include "DS18B20Reader.h"
 #include "HeltecBoard.h"     // your board helpers (VEXT/OLED/batt/deepSleep)
-#include "Battery.h"
-#include "ChipTemp.h"
-
-RTC_DATA_ATTR uint32_t cycleCount = 0;
+#include "HTU21DReader.h"
+#include "UplinkSettings.h"
 
 // ---------- LoRaWAN session persistence ----------
 Preferences _prefs;  // NVS namespace "lw"
@@ -79,22 +77,44 @@ void setup() {
   // Preferences p; p.begin("lw", false); p.clear(); p.end();
   // === END ONE-TIME RESET ===
 
-  cycleCount++;
-  Heltec::begin();  // power VEXT, init OLED + batt ADC
+  Heltec::begin();
 
-  // --- (optional) quick wake banner — app logic lives in main, not header ---
-  {
-    String banner = String("WAKE ") + String(cycleCount);
+  int16_t st = RADIOLIB_ERR_NONE;
+  UplinkSettings::Values settings = UplinkSettings::load();
+
+  DS18B20Reader::Discovery ds18b20;
+  constexpr uint8_t kDs18b20ScanCount = 13;  // 0 through 120 seconds, every 10 seconds.
+  for (uint8_t scan = 0; scan < kDs18b20ScanCount; ++scan) {
+    ds18b20 = DS18B20Reader::discover();
+    Serial.printf("DS18B20 scan %u/%u\n", scan + 1, kDs18b20ScanCount);
+    Serial.printf("DS18B20 GPIO%d idle level: %s\n", DS18B20Reader::kDataPin,
+                  ds18b20.lineHigh ? "HIGH" : "LOW");
+    Serial.printf("DS18B20 bus present: %s\n", ds18b20.busPresent ? "yes" : "no");
+    Serial.printf("DS18B20 sensors found: %u\n", ds18b20.count);
+    for (uint8_t index = 0; index < ds18b20.count; ++index) {
+      Serial.printf("DS%u address: %s\n", index + 1, ds18b20.addresses[index]);
+      DS18B20Reader::showAddress(Heltec::display, index + 1, ds18b20.addresses[index]);
+    }
+    if (scan + 1 < kDs18b20ScanCount) delay(10000);
+  }
+
+  HTU21DReader::Readings readings{};
+  const bool sensorReady = HTU21DReader::begin() && HTU21DReader::read(readings);
+  if (!sensorReady) {
     Heltec::display.clear();
     Heltec::display.setFont(ArialMT_Plain_16);
     Heltec::display.setTextAlignment(TEXT_ALIGN_CENTER);
-    Heltec::display.drawString(64, 24, banner);
+    Heltec::display.drawString(64, 24, "HTU21D error");
     Heltec::display.display();
     delay(2000);
+    goto SLEEP;
   }
 
+  HTU21DReader::show(Heltec::display, readings, "Sending...");
+  delay(2000);
+
   // -------- Radio + LoRaWAN --------
-  int16_t st = radio.begin();
+  st = radio.begin();
   if (st != RADIOLIB_ERR_NONE) goto SLEEP;
 
   st = node.beginOTAA(joinEUI, devEUI, nwkKey, appKey);
@@ -108,36 +128,35 @@ void setup() {
 
   // -------- ONE uplink per wake --------
   {
-    uint16_t batt_mv = Heltec::readBatteryMilliVolts();
-    uint8_t  v1 = radio.random(100);
-    uint16_t v2 = radio.random(2000);
+    ++settings.uploadCount;
+    char payload[64];
+    const size_t payloadLength = HTU21DReader::formatPayload(
+        readings, settings.uploadCount, settings.intervalSeconds,
+        settings.lastDownlinkRssi, payload, sizeof(payload));
 
-    uint8_t payload[5] = {
-      v1,
-      (uint8_t)(v2 >> 8), (uint8_t)v2,
-      (uint8_t)(batt_mv >> 8), (uint8_t)batt_mv
-    };
-
-    st = node.sendReceive(payload, sizeof(payload));
+    uint8_t downlink[16]{};
+    size_t downlinkLength = sizeof(downlink);
+    st = node.sendReceive(reinterpret_cast<const uint8_t*>(payload), payloadLength, 1,
+                          downlink, &downlinkLength);
     if (st >= RADIOLIB_ERR_NONE) {
       lwSave(node);                // CRITICAL: save after successful uplink
+      if (st > RADIOLIB_ERR_NONE) {
+        settings.lastDownlinkRssi = static_cast<int16_t>(lroundf(radio.getRSSI()));
+        UplinkSettings::applyIntervalCommand(downlink, downlinkLength, settings);
+      }
+      UplinkSettings::save(settings);
     }
   }
 
 SLEEP:
-  // quick status (optional)
-  Heltec::display.clear();
-  Heltec::display.setTextAlignment(TEXT_ALIGN_CENTER);
-  Heltec::display.setFont(ArialMT_Plain_16);
-  Heltec::display.drawString(64, 24, (st >= 0) ? "Sent ✓" : "Send fail");
-  Heltec::display.display();
+  if (sensorReady) {
+    HTU21DReader::show(Heltec::display, readings, (st >= 0) ? "Sent" : "Send failed");
+  }
   delay(2000);
 
-  // sleep ~20s; all rails are powered down inside your header
-  Heltec::deepSleep(300);
+  Heltec::deepSleep(settings.intervalSeconds);
 }
 
 void loop() {
   // never reached
 }
-
